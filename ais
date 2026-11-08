@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Visualizador de cartas AISWEB. Uso: python3 aisweb_viewer.py  (abre http://localhost:8765)
+Busca a página pública do aeródromo no site da AISWEB, extrai as cartas e as exibe lado a lado.
+Só biblioteca padrão do Python 3.8+. Escuta apenas em 127.0.0.1."""
+import hashlib, json, os, re, threading, time, webbrowser
+from html.parser import HTMLParser
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs, urljoin
+from urllib.request import Request, urlopen
+
+PORT = 8765
+BASE = "https://aisweb.decea.mil.br/"
+CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache_aisweb")
+os.makedirs(CACHE, exist_ok=True)
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+      "Accept-Language": "pt-BR,pt;q=0.9", "Referer": BASE}
+SKIP = {"METAR", "TAF", "NOTAM", "ROTAER", "TEMP", "RCR"}
+LISTAS = {}  # codigo -> (timestamp, dados)
+
+
+def baixar(url, timeout=60):
+    with urlopen(Request(url, headers=UA), timeout=timeout) as r:
+        return r.read(), r.headers.get("Content-Type", "")
+
+
+class Parser(HTMLParser):
+    """Percorre o HTML em ordem: títulos (ADC, IAC, SID...) definem o tipo; links /download/?arquivo= são as cartas."""
+    def __init__(s, base):
+        super().__init__(); s.base = base; s.tipo = "OUTRO"; s.cartas = []; s.title = ""
+        s.buf = None; s.mode = None; s.tag = None; s.href = None
+
+    def handle_starttag(s, tag, attrs):
+        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            s.buf = []; s.mode = "h"; s.tag = tag
+        elif tag == "a":
+            h = dict(attrs).get("href") or ""
+            if "download/?arquivo=" in h or "download?arquivo=" in h:
+                s.href = urljoin(s.base, h); s.buf = []; s.mode = "a"
+
+    def handle_data(s, d):
+        if s.buf is not None:
+            s.buf.append(d)
+
+    def handle_endtag(s, tag):
+        if s.mode == "h" and tag == s.tag:
+            t = " ".join("".join(s.buf).split())
+            if tag == "h1" and not s.title and "(" in t:
+                s.title = t
+            if re.fullmatch(r"[A-Z]{2,7}", t) and t not in SKIP:
+                s.tipo = t
+            s.buf = None; s.mode = None
+        elif s.mode == "a" and tag == "a":
+            nome = " ".join("".join(s.buf).split()) or "(sem nome)"
+            s.cartas.append({"tipo": s.tipo, "nome": nome, "url": s.href})
+            s.buf = None; s.mode = None; s.href = None
+
+
+def aerodromo(codigo, fresco=False):
+    if not fresco and codigo in LISTAS and time.time() - LISTAS[codigo][0] < 1800:
+        return LISTAS[codigo][1]
+    html = baixar(BASE + "?i=aerodromos&codigo=" + codigo, 40)[0].decode("utf-8", "replace")
+    p = Parser(BASE); p.feed(html)
+    vistos, cartas = set(), []
+    for c in p.cartas:
+        if c["url"] not in vistos:
+            vistos.add(c["url"]); cartas.append(c)
+    if not cartas:
+        raise ValueError("Nenhuma carta encontrada para " + codigo + " (código inexistente ou o site mudou o formato).")
+    nome = re.sub(r"\s*CIAD:.*$", "", p.title).strip() or codigo
+    dados = {"codigo": codigo, "nome": nome, "cartas": cartas}
+    LISTAS[codigo] = (time.time(), dados)
+    return dados
+
+
+def carta(url):
+    h = urlparse(url)
+    if h.scheme != "https" or not (h.hostname or "").endswith((".decea.gov.br", ".decea.mil.br")) or not h.path.startswith("/download"):
+        raise ValueError("URL não permitida")
+    chave = os.path.join(CACHE, hashlib.sha1(url.encode()).hexdigest())
+    if os.path.exists(chave + ".bin"):
+        return open(chave + ".bin", "rb").read(), open(chave + ".ct").read()
+    corpo, ct = baixar(url)
+    if "pdf" in ct.lower() or corpo[:4] == b"%PDF":
+        ct = "application/pdf"
+    open(chave + ".bin", "wb").write(corpo); open(chave + ".ct", "w").write(ct)
+    return corpo, ct
+
+
+class H(BaseHTTPRequestHandler):
+    def log_message(s, *a): pass
+
+    def resp(s, code, corpo, ct, extra=None):
+        s.send_response(code); s.send_header("Content-Type", ct); s.send_header("Content-Length", str(len(corpo)))
+        for k, v in (extra or {}).items(): s.send_header(k, v)
+        s.end_headers(); s.wfile.write(corpo)
+
+    def do_GET(s):
+        u = urlparse(s.path); q = parse_qs(u.query)
+        try:
+            if u.path == "/":
+                s.resp(200, PAGE.encode(), "text/html; charset=utf-8")
+            elif u.path == "/api/aerodromo":
+                cod = (q.get("codigo", [""])[0]).strip().upper()
+                if not re.fullmatch(r"[A-Z0-9]{3,4}", cod): raise ValueError("Código ICAO inválido")
+                s.resp(200, json.dumps(aerodromo(cod, "fresh" in q)).encode(), "application/json")
+            elif u.path == "/carta":
+                corpo, ct = carta(q.get("u", [""])[0])
+                s.resp(200, corpo, ct, {"Content-Disposition": "inline"})
+            else:
+                s.resp(404, b"404", "text/plain")
+        except Exception as e:
+            try: s.resp(502, json.dumps({"erro": str(e)}).encode(), "application/json")
+            except Exception: pass
+
+
+PAGE = r"""<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cartas AISWEB</title><style>
+:root{color-scheme:light dark;--bg:#f5f6f8;--pn:#fff;--tx:#1b1f24;--mu:#6b7380;--bd:#d8dce2;--ac:#0b5fff}
+@media(prefers-color-scheme:dark){:root{--bg:#14171b;--pn:#1d2227;--tx:#e8eaed;--mu:#9aa3ad;--bd:#303740;--ac:#5b8cff}}
+*{box-sizing:border-box}html,body{height:100%;margin:0}body{font:14px system-ui,sans-serif;background:var(--bg);color:var(--tx);display:flex}
+aside{width:340px;min-width:280px;background:var(--pn);border-right:1px solid var(--bd);display:flex;flex-direction:column;padding:12px;gap:8px}
+main{flex:1;display:flex;flex-direction:column;min-width:0}h1{font-size:16px;margin:0}
+input,select,button{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:6px 8px}
+button{cursor:pointer}button:hover{border-color:var(--ac)}button.p{background:var(--ac);color:#fff;border-color:var(--ac)}
+.row{display:flex;gap:6px}.row>*{flex:1;min-width:0}.row>button{flex:0 0 auto}
+#list{flex:1;overflow:auto;border:1px solid var(--bd);border-radius:6px}
+.it{padding:6px 8px;border-bottom:1px solid var(--bd);display:flex;gap:6px;align-items:center;cursor:pointer}.it:hover{background:var(--bg)}.it.on{border-left:3px solid var(--ac)}
+.it b{font-size:11px;background:var(--bd);border-radius:4px;padding:1px 5px;white-space:nowrap}.it span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mu{color:var(--mu);font-size:12px}.chips{display:flex;gap:4px;flex-wrap:wrap}
+.chip{background:var(--bg);border:1px solid var(--bd);border-radius:12px;padding:2px 8px;font-size:12px}.chip i{font-style:normal;cursor:pointer;padding-left:6px}
+.bar{display:flex;gap:8px;align-items:center;padding:8px 12px;background:var(--pn);border-bottom:1px solid var(--bd)}
+#grid{flex:1;display:grid;gap:6px;padding:6px;min-height:0}.pane{background:var(--pn);border:1px solid var(--bd);border-radius:6px;display:flex;flex-direction:column;min-height:0;min-width:0}
+.ph{display:flex;gap:6px;align-items:center;padding:4px 8px;border-bottom:1px solid var(--bd)}.ph span{flex:1;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ph button{padding:2px 7px}
+.pane iframe{flex:1;border:0;min-height:0;background:#fff}.empty{margin:auto;color:var(--mu);text-align:center;padding:30px}
+</style></head><body>
+<aside><h1>Cartas AISWEB</h1>
+<div class="row"><input id="code" placeholder="ICAO (ex.: SBGR)" maxlength="4"><button class="p" id="go">Buscar</button></div>
+<div class="chips" id="chips"></div><div class="mu" id="st"></div>
+<div class="row"><select id="fA"></select><select id="fT"></select></div>
+<input id="fQ" placeholder="Filtrar pelo nome (ex.: ILS, RWY 28L, RNAV)">
+<div class="mu" id="cnt"></div><div id="list"></div>
+<button class="p" id="all">Abrir todas do filtro</button></aside>
+<main><div class="bar"><span class="mu">Colunas:</span><select id="cols"><option value="0">auto</option><option>1</option><option>2</option><option>3</option></select>
+<button id="clr">Fechar todos</button><span class="mu" style="margin-left:auto">Clique numa carta para abrir/fechar. Máx. 6 painéis.</span></div><div id="grid"></div></main>
+<script>
+const $=s=>document.querySelector(s);let ap={},panes=[];
+const ls=(k,v)=>{try{if(v===undefined)return JSON.parse(localStorage.getItem(k)||"null");localStorage.setItem(k,JSON.stringify(v))}catch(e){return null}};
+const items=()=>Object.values(ap).flatMap(a=>a.cartas.map(c=>({...c,icao:a.codigo})));
+async function load(code,fresh){code=code.trim().toUpperCase();if(!code)return;$("#st").textContent="Buscando "+code+" na AISWEB…";
+  try{const r=await fetch("/api/aerodromo?codigo="+code+(fresh?"&fresh=1":""));const j=await r.json();if(!r.ok)throw Error(j.erro);
+    ap[code]=j;$("#st").textContent=j.nome+": "+j.cartas.length+" cartas";ls("aw_codes",Object.keys(ap));$("#fA").value=code}
+  catch(e){$("#st").textContent="Erro: "+e.message}render()}
+function filt(){const a=$("#fA").value,t=$("#fT").value,q=$("#fQ").value.toLowerCase();
+  return items().filter(i=>(!a||i.icao===a)&&(!t||i.tipo===t)&&(!q||i.nome.toLowerCase().includes(q)))}
+function sel(el,vals,first){const c=el.value;el.innerHTML="";el.add(new Option(first,""));vals.forEach(v=>el.add(new Option(v,v)));if(vals.includes(c))el.value=c}
+function render(){const all=items();
+  sel($("#fA"),Object.keys(ap),"Todos os aeroportos");sel($("#fT"),[...new Set(all.map(i=>i.tipo))].sort(),"Todos os tipos");
+  $("#chips").innerHTML="";Object.keys(ap).forEach(c=>{const d=document.createElement("span");d.className="chip";d.textContent=c;
+    const r=document.createElement("i");r.textContent="↻";r.title="Atualizar";r.onclick=()=>load(c,1);
+    const x=document.createElement("i");x.textContent="✕";x.title="Remover";x.onclick=()=>{delete ap[c];panes=panes.filter(u=>all.find(i=>i.url===u&&i.icao!==c));ls("aw_codes",Object.keys(ap));render()};
+    d.append(r,x);$("#chips").append(d)});
+  const f=filt().sort((x,y)=>(x.icao+x.tipo+x.nome).localeCompare(y.icao+y.tipo+y.nome));$("#cnt").textContent=f.length+" carta(s) no filtro";
+  const L=$("#list");L.innerHTML=f.length?"":'<div class="empty">Digite um código ICAO e clique em Buscar.</div>';
+  f.forEach(i=>{const d=document.createElement("div");d.className="it"+(panes.includes(i.url)?" on":"");
+    d.innerHTML="<b></b><span></span>";d.children[0].textContent=i.icao+" "+i.tipo;d.children[1].textContent=i.nome;d.title=i.nome;d.onclick=()=>toggle(i.url);L.append(d)});
+  panel();ls("aw_panes",panes)}
+function toggle(u){panes.includes(u)?panes=panes.filter(x=>x!==u):(panes.length>=6&&panes.shift(),panes.push(u));render()}
+function panel(){const g=$("#grid");g.innerHTML="";const all=items();
+  if(!panes.length){g.style.gridTemplateColumns="1fr";g.style.gridTemplateRows="";g.innerHTML='<div class="empty">Selecione cartas na lista para compará-las lado a lado.</div>';return}
+  const n=panes.length,c=+$("#cols").value||(n<=1?1:n<=4?2:3);g.style.gridTemplateColumns="repeat("+c+",minmax(0,1fr))";g.style.gridTemplateRows="repeat("+Math.ceil(n/c)+",minmax(0,1fr))";
+  panes.forEach(u=>{const i=all.find(x=>x.url===u);if(!i)return;const s="/carta?u="+encodeURIComponent(u),p=document.createElement("div");p.className="pane";
+    p.innerHTML='<div class="ph"><span></span><button title="Abrir em nova aba">↗</button><button title="Fechar">✕</button></div><iframe></iframe>';
+    p.querySelector("span").textContent=i.icao+" • "+i.tipo+" • "+i.nome;p.querySelector("iframe").src=s+"#view=Fit";
+    const b=p.querySelectorAll("button");b[0].onclick=()=>window.open(s);b[1].onclick=()=>toggle(u);g.append(p)})}
+$("#go").onclick=()=>load($("#code").value);$("#code").onkeydown=e=>{if(e.key==="Enter")load($("#code").value)};
+["#fA","#fT"].forEach(s=>$(s).onchange=render);$("#fQ").oninput=render;$("#cols").onchange=panel;$("#clr").onclick=()=>{panes=[];render()};
+$("#all").onclick=()=>{const f=filt();if(f.length>6&&!confirm("São "+f.length+" cartas; abrir as 6 primeiras?"))return;panes=f.slice(0,6).map(i=>i.url);render()};
+(async()=>{const saved=ls("aw_panes")||[];for(const c of ls("aw_codes")||[])await load(c);panes=saved.filter(u=>items().some(i=>i.url===u));render()})();
+</script></body></html>"""
+
+if __name__ == "__main__":
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", PORT), H)
+    except OSError:
+        raise SystemExit("A porta %d já está em uso. Feche a outra instância ou mude PORT no script." % PORT)
+    print("Visualizador rodando em http://localhost:%d  (Ctrl+C para encerrar)" % PORT)
+    threading.Timer(1, lambda: webbrowser.open("http://localhost:%d" % PORT)).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
